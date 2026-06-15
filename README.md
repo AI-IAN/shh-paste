@@ -47,6 +47,24 @@ Pipe mode for scripting:
 uv run shh_paste.py --once >> ~/notes.md
 ```
 
+## Reliability & recovery
+
+The microphone is driven on a dedicated, serialized audio thread (`recorder.py`) - never
+on the keyboard thread, and never with two device operations overlapping. Those were the
+two conditions behind a CoreAudio deadlock that could freeze the hotkey under rapid
+start/stop. On top of that the daemon never loses a recording:
+
+- **Audio is streamed to disk** (`data/last_recording.wav`) as you speak, so a crash,
+  kill, or wedge can't lose a clip.
+- **`uv run shh_paste.py --recover`** re-transcribes that last clip to the clipboard.
+- **Rescue without the keyboard:** `pkill -USR1 -f shh_paste.py` forces stop + transcribe
+  of whatever is recording.
+- **Self-heal:** if any audio operation wedges for more than 8 seconds, the daemon
+  restarts itself; the in-flight clip is still recoverable from disk.
+
+The `shh` helper wraps these as one-word commands - `shh rescue`, `shh recover`,
+`shh status`, `shh start`/`stop`/`restart`. Run `./shh help` for the full list.
+
 ## Configuration
 
 Edit the `CONFIG` block at the top of `shh_paste.py`, or create a TOML config file:
@@ -87,6 +105,7 @@ The first run will prompt for **Microphone** access. You also need to manually e
 
 | Script | What |
 |--------|------|
+| `shh` | Control helper: `start`/`stop`/`restart`/`status`/`logs` + `rescue`/`recover`/`stuck` (`./shh help`) |
 | `start.sh` | Start shh-paste |
 | `stop.sh` | Stop shh-paste |
 | `install.sh` | Install deps, download model, optionally set up auto-start on login |

@@ -42,8 +42,9 @@ snapshot_download("mlx-community/whisper-large-v3-turbo")
 print("  Model ready.", flush=True)
 PYEOF
 
-# ── Make main script executable ─────────────────────────────────────────────
+# ── Make scripts executable ──────────────────────────────────────────────────
 chmod +x "$SHH_PASTE"
+[ -f "$SCRIPT_DIR/shh" ] && chmod +x "$SCRIPT_DIR/shh"
 
 # ── Generate helper scripts ──────────────────────────────────────────────────
 cat > "$SCRIPT_DIR/start.sh" <<'STARTEOF'
@@ -150,13 +151,15 @@ echo "╔═══════════════════════�
 echo "║                        Done!                              ║"
 echo "╚════════════════════════════════════════════════════════════╝"
 echo ""
-echo "  Start:       ./start.sh"
-echo "  Stop:        ./stop.sh"
+echo "  Start:       ./start.sh        (or: ./shh start)"
+echo "  Stop:        ./stop.sh         (or: ./shh stop)"
+echo "  Control:     ./shh help        (status / restart / logs / rescue / recover)"
 echo "  Logs:        tail -f /tmp/shh-paste.log"
 echo "  Uninstall:   ./uninstall.sh"
 echo ""
 echo "  Config:      edit the CONFIG block at the top of shh_paste.py"
 echo "               TRIGGER_MODE  = 'hold', 'toggle', or 'smart'"
-echo "               MODEL         = 'base' | 'small' | 'medium'"
+echo "               MODEL         = 'mlx-community/whisper-large-v3-turbo'"
+echo "                               (or '...whisper-small-mlx' — faster, less accurate)"
 echo "               HOTKEY        = 'right_alt' | 'f13' | 'f14' ..."
 echo ""

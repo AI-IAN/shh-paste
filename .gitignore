@@ -3,5 +3,10 @@ __pycache__/
 *.pyc
 .env
 data/
-.claude/
 *.toml
+# Belt-and-suspenders: no databases or audio can ever be committed, even outside data/
+*.db
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.wav

@@ -25,11 +25,13 @@ Modes:
 import argparse
 import os
 import re
+import signal
 import sqlite3
 import sys
 import subprocess
 import threading
 import time
+import wave
 from datetime import datetime
 from pathlib import Path
 import tomllib
@@ -37,6 +39,8 @@ import numpy as np
 import sounddevice as sd
 from pynput import keyboard
 import mlx_whisper
+
+from recorder import AudioRecorder
 
 
 # ========== CONFIG ==========
@@ -59,6 +63,13 @@ AUDIO_DEVICE  = None          # None = system default mic
                               # Or set to a name string, e.g. "MacBook Air Microphone"
                               # Run: python3 -c "import sounddevice; print(sounddevice.query_devices())"
 SAMPLE_RATE   = 16000         # Whisper requires 16kHz — do not change
+INITIAL_PROMPT = ""           # String passed to Whisper to bias vocabulary/spelling toward
+                              # specific proper nouns and jargon. Keep short (< ~200 tokens).
+                              # Example: "Kubernetes, PostgreSQL, GraphQL, nginx, Redis."
+SUBSTITUTIONS = {}            # Post-transcription regex fixes for stubborn mishears.
+                              # Keys are literal phrases (case-insensitive, word-bounded);
+                              # values are the exact replacement text.
+                              # Example: { "my sequel" = "MySQL" }
 
 # Voice memo mode — Cmd + HOTKEY appends timestamped transcription to a file
 MEMO_FILE     = os.path.expanduser("~/voice-notes.md")  # Where memos are saved
@@ -71,7 +82,7 @@ _CONFIG_KEYS = {
     "model", "trigger_mode", "long_press_threshold", "hotkey",
     "filler_remove", "auto_paste", "notification", "notify_start",
     "max_record", "warn_before", "audio_device", "sample_rate",
-    "memo_file", "memo_mode",
+    "memo_file", "memo_mode", "initial_prompt", "substitutions",
 }
 for _cfg_path in (Path.home() / ".config" / "shh-paste" / "config.toml", Path("shh-paste.toml")):
     if _cfg_path.is_file():
@@ -98,6 +109,12 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "shh_
 
 FILLER_RE = re.compile(r'\b(um+|uh+|you know|like)\b\s*', re.IGNORECASE)
 _transcribe_lock = threading.Lock()
+
+# Compile substitution patterns — word-bounded, case-insensitive literal phrase match.
+_SUBSTITUTION_PATTERNS = [
+    (re.compile(r'\b' + re.escape(_k) + r'\b', re.IGNORECASE), _v)
+    for _k, _v in SUBSTITUTIONS.items()
+]
 
 
 def _init_db():
@@ -154,7 +171,72 @@ def _log_transcription(text: str, mode: str, audio_seconds: float | None = None,
 
 
 def log(msg: str):
-    print(msg, flush=True)
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+# ── Silence-hallucination blocklist ────────────────────────────────────────────
+# Whisper outputs these phrases on silence/near-silence even when no_speech_threshold
+# is set. Strip punctuation and lowercasebefore comparing.
+_SILENCE_HALLUCINATIONS = {
+    "thank you",
+    "thanks for watching",
+    "thank you for watching",
+    "you",
+    ".",
+    "",
+    "bye",
+    "bye bye",
+    "please subscribe",
+    "subscribe",
+}
+
+
+def _is_silence_hallucination(text: str) -> bool:
+    normalized = text.strip().rstrip(".!?,").strip().lower()
+    return normalized in _SILENCE_HALLUCINATIONS
+
+
+# ── Repetition-hallucination guard ─────────────────────────────────────────────
+# whisper-large-v3-turbo occasionally falls into a decode loop and emits one token
+# hundreds of times ("page page page…"). Collapse runs; if a run is pathological,
+# the caller discards the whole transcription so it never gets pasted.
+REPEAT_HALLUCINATION = 8   # consecutive identical tokens => treat as decode failure
+
+
+def _collapse_repeats(text: str, max_keep: int = 3) -> tuple[str, int]:
+    """Collapse runs of an identical token. Returns (collapsed_text, longest_run)."""
+    out: list[str] = []
+    longest = 0
+    run_key = None
+    run = 0
+    for w in text.split():
+        key = w.lower().strip(".,!?-")
+        if key and key == run_key:
+            run += 1
+        else:
+            run_key = key
+            run = 1
+        longest = max(longest, run)
+        if run <= max_keep:
+            out.append(w)
+    return " ".join(out), longest
+
+
+def _has_concatenated_repeat(text: str, min_unit: int = 2, threshold: int = 8) -> bool:
+    """Detect runaway repetition with no spaces, e.g. "нологнологнолог…".
+
+    Scans the longest whitespace-free token; if any short substring repeats
+    back-to-back >= threshold times, it's a decode-loop hallucination.
+    """
+    for token in text.split():
+        n = len(token)
+        if n < min_unit * threshold:
+            continue
+        for unit in range(min_unit, n // threshold + 1):
+            seg = token[:unit]
+            if seg * threshold in token:
+                return True
+    return False
 
 
 def clean(text: str) -> str:
@@ -162,6 +244,8 @@ def clean(text: str) -> str:
     if FILLER_REMOVE:
         text = FILLER_RE.sub('', text).strip()
         text = re.sub(r'  +', ' ', text)
+    for pattern, replacement in _SUBSTITUTION_PATTERNS:
+        text = pattern.sub(replacement, text)
     return text
 
 
@@ -224,343 +308,315 @@ def deliver_memo(text: str, audio_seconds: float | None = None):
 def transcribe(audio: np.ndarray) -> str:
     log("⟳  Transcribing...")
     audio_flat = audio.flatten().astype(np.float32)
-    result = mlx_whisper.transcribe(audio_flat, path_or_hf_repo=MODEL, language="en", condition_on_previous_text=False)
-    return clean(result["text"])
+    kwargs = {
+        "path_or_hf_repo": MODEL,
+        "language": "en",
+        "condition_on_previous_text": False,
+        # Decode-time repetition/silence guards. compression_ratio_threshold is
+        # the robust catch — it works on raw decoder output regardless of spacing.
+        "compression_ratio_threshold": 2.4,
+        "no_speech_threshold": 0.6,
+        "temperature": (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+    }
+    if INITIAL_PROMPT:
+        kwargs["initial_prompt"] = INITIAL_PROMPT
+    result = mlx_whisper.transcribe(audio_flat, **kwargs)
+    text, max_run = _collapse_repeats(result["text"])
+    if max_run >= REPEAT_HALLUCINATION or _has_concatenated_repeat(result["text"]):
+        log(f"⚠  Repetition hallucination (run x{max_run}) — discarding garbage output")
+        return ""
+    cleaned = clean(text)
+    if _is_silence_hallucination(cleaned):
+        log(f"⚠  Silence hallucination ({repr(cleaned)}) — discarding")
+        return ""
+    return cleaned
+
+
+# A normal decode is a few seconds. If one runs past this it is wedged — abandon it
+# so it can never hold _transcribe_lock forever and freeze every later clip.
+TRANSCRIBE_TIMEOUT = 90   # seconds
+
+
+def _transcribe_with_timeout(audio: np.ndarray) -> str:
+    """Run transcribe() in a worker thread; raise TimeoutError if it wedges."""
+    box: dict = {}
+
+    def _run():
+        try:
+            box["text"] = transcribe(audio)
+        except Exception as e:  # noqa: BLE001
+            box["error"] = e
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    worker.join(TRANSCRIBE_TIMEOUT)
+    if worker.is_alive():
+        raise TimeoutError(f"transcription exceeded {TRANSCRIBE_TIMEOUT}s")
+    if "error" in box:
+        raise box["error"]
+    return box.get("text", "")
+
+
+def warm_up_model():
+    """Load + JIT the model once at startup with a short silent clip, so the first
+    real dictation isn't slowed by a cold model load. Runs in a daemon thread."""
+    try:
+        t0 = time.time()
+        silence = np.zeros(int(SAMPLE_RATE * 0.5), dtype=np.float32)
+        with _transcribe_lock:
+            transcribe(silence)
+        log(f"✓  Model warm ({time.time() - t0:.1f}s) — first dictation will be fast")
+    except Exception as e:  # noqa: BLE001
+        log(f"⚠  Warm-up skipped: {e}")
 
 
 def process_audio(audio: np.ndarray):
-    """Transcribe and deliver audio. Serialized — no parallel transcriptions."""
+    """Transcribe and deliver audio. Serialized; a wedged decode is abandoned, not blocking."""
     audio_seconds = len(audio) / SAMPLE_RATE
-    with _transcribe_lock:
-        try:
-            text = transcribe(audio)
-            deliver(text, audio_seconds)
-        except Exception as e:
-            log(f"✗  Error during transcription: {e}")
+    if not _transcribe_lock.acquire(timeout=TRANSCRIBE_TIMEOUT + 10):
+        log("⚠  Previous transcription still busy — skipping this clip")
+        return
+    try:
+        text = _transcribe_with_timeout(audio)
+        deliver(text, audio_seconds)
+    except TimeoutError as e:
+        log(f"✗  {e} — abandoned so the hotkey stays responsive")
+    except Exception as e:
+        log(f"✗  Error during transcription: {e}")
+    finally:
+        _transcribe_lock.release()
 
 
 def process_memo(audio: np.ndarray):
-    """Transcribe and save as voice memo. Serialized."""
+    """Transcribe and save as voice memo. Serialized; a wedged decode is abandoned."""
     audio_seconds = len(audio) / SAMPLE_RATE
-    with _transcribe_lock:
-        try:
-            text = transcribe(audio)
-            deliver_memo(text, audio_seconds)
-        except Exception as e:
-            log(f"✗  Error during memo transcription: {e}")
+    if not _transcribe_lock.acquire(timeout=TRANSCRIBE_TIMEOUT + 10):
+        log("⚠  Previous transcription still busy — skipping this memo")
+        return
+    try:
+        text = _transcribe_with_timeout(audio)
+        deliver_memo(text, audio_seconds)
+    except TimeoutError as e:
+        log(f"✗  {e} — abandoned so the hotkey stays responsive")
+    except Exception as e:
+        log(f"✗  Error during memo transcription: {e}")
+    finally:
+        _transcribe_lock.release()
 
 
-class Recorder:
-    """Handles audio capture via sounddevice."""
 
-    def __init__(self):
-        self._chunks: list[np.ndarray] = []
-        self._stream: sd.InputStream | None = None
-        self._lock = threading.Lock()
+# ── Audio engine + listeners ────────────────────────────────────────────────────
+# The recorder (recorder.py) drives the mic on ONE dedicated, serialized thread, so a
+# CoreAudio open/stop can never run on the keyboard thread or overlap another — the two
+# conditions behind the deadlock that used to freeze the hotkey. Key callbacks here only
+# post non-blocking start/stop intents; finished audio comes back via on_audio.
 
-    @property
-    def active(self) -> bool:
-        return self._stream is not None
-
-    def start(self):
-        with self._lock:
-            if self._stream is not None:
-                return
-            self._chunks = []
-            log("●  Recording...")
-
-            def _callback(indata, frames, t, status):
-                self._chunks.append(indata.copy())
-
-            self._stream = sd.InputStream(
-                samplerate=SAMPLE_RATE,
-                channels=1,
-                dtype='float32',
-                callback=_callback,
-                device=AUDIO_DEVICE,
-            )
-            self._stream.start()
-
-    def stop(self) -> np.ndarray | None:
-        """Stop recording and return audio array, or None if too short."""
-        with self._lock:
-            if self._stream is None:
-                return None
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
-
-        if not self._chunks:
-            return None
-        audio = np.concatenate(self._chunks, axis=0)
-        # Require at least 0.5s to avoid accidental hotkey triggers
-        if len(audio) < SAMPLE_RATE * 0.5:
-            log("⚠  Recording too short, ignoring")
-            return None
-        return audio
+RECORDING_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "last_recording.wav")
+OP_TIMEOUT = 8.0   # an audio op slower than this is treated as wedged → self-restart
 
 
-class HoldListener:
-    """
-    Hold-to-record: hold HOTKEY to record, release to transcribe.
-    Recordings longer than MAX_RECORD seconds are auto-stopped.
-    """
+def _offload(process_fn):
+    """Wrap a processor so transcription runs OFF the audio-control thread."""
+    def _cb(audio, seconds):
+        threading.Thread(target=process_fn, args=(audio,), daemon=True).start()
+    return _cb
 
-    def __init__(self, target_key, process_fn=None):
+
+def _on_wedged(op, secs):
+    """Last-ditch safety: if an audio op ever hangs, restart so it can't stick forever.
+    The in-flight clip survives on disk (RECORDING_PATH) and is recoverable."""
+    log(f"✗  Audio op '{op}' wedged > {secs:.0f}s — self-restarting to recover")
+    try:
+        notify("Audio stuck — restarting (clip saved, use: shh recover)")
+    except Exception:
+        pass
+    os._exit(75)   # non-zero → the services watchdog reloads a clean process
+
+
+class _BaseListener:
+    """Shared plumbing: key events become non-blocking recorder intents."""
+
+    def __init__(self, target_key, recorder):
         self._key = target_key
-        self._recorder = Recorder()
-        self._timer: threading.Timer | None = None
-        self._warn_timer: threading.Timer | None = None
+        self._rec = recorder
         self._lock = threading.Lock()
-        self._process_fn = process_fn or process_audio
 
-    def _warn(self):
-        log(f"⚠  {WARN_BEFORE}s of recording time remaining")
-        if NOTIFICATION:
-            notify(f"Recording — {WARN_BEFORE}s remaining")
+    def _reset(self):
+        """Clear recording state. Called under self._lock. Overridden where needed."""
 
-    def _auto_stop(self):
-        log(f"⚠  Max record time ({MAX_RECORD}s) reached, stopping")
-        if NOTIFICATION:
-            notify(f"Max {MAX_RECORD}s reached — transcribing…")
-        audio = self._recorder.stop()
-        if audio is not None:
-            threading.Thread(target=self._process_fn, args=(audio,), daemon=True).start()
+    def force_finish(self) -> bool:
+        """External stop (SIGUSR1 rescue), bypassing the keyboard."""
+        if not self._rec.active:
+            return False
+        with self._lock:
+            self._reset()
+        self._rec.stop()
+        return True
+
+
+class HoldListener(_BaseListener):
+    """Hold HOTKEY to record, release to transcribe."""
 
     def on_press(self, key):
-        if key != self._key:
-            return
-        with self._lock:
-            if not self._recorder.active:
-                self._recorder.start()
+        if key == self._key and not self._rec.active:
+            with self._lock:
+                self._rec.start()
                 if NOTIFY_START:
                     notify("Recording…")
-                warn_at = MAX_RECORD - WARN_BEFORE
-                if warn_at > 0:
-                    self._warn_timer = threading.Timer(warn_at, self._warn)
-                    self._warn_timer.start()
-                self._timer = threading.Timer(MAX_RECORD, self._auto_stop)
-                self._timer.start()
 
     def on_release(self, key):
-        if key != self._key:
-            return
-        with self._lock:
-            if self._timer:
-                self._timer.cancel()
-                self._timer = None
-            if self._warn_timer:
-                self._warn_timer.cancel()
-                self._warn_timer = None
-            if self._recorder.active:
-                audio = self._recorder.stop()
-                if audio is not None:
-                    threading.Thread(target=self._process_fn, args=(audio,), daemon=True).start()
+        if key == self._key:
+            with self._lock:
+                self._rec.stop()
 
 
-class ToggleListener:
-    """
-    Toggle mode: press HOTKEY to start recording, press again to stop + transcribe.
-    """
-
-    def __init__(self, target_key, process_fn=None):
-        self._key = target_key
-        self._recorder = Recorder()
-        self._lock = threading.Lock()
-        self._timer: threading.Timer | None = None
-        self._warn_timer: threading.Timer | None = None
-        self._process_fn = process_fn or process_audio
-
-    def _warn(self):
-        log(f"⚠  {WARN_BEFORE}s of recording time remaining")
-        if NOTIFICATION:
-            notify(f"Recording — {WARN_BEFORE}s remaining")
-
-    def _auto_stop(self):
-        log(f"⚠  Max record time ({MAX_RECORD}s) reached, stopping")
-        if NOTIFICATION:
-            notify(f"Max {MAX_RECORD}s reached — transcribing…")
-        audio = self._recorder.stop()
-        if audio is not None:
-            threading.Thread(target=self._process_fn, args=(audio,), daemon=True).start()
-
-    def _cancel_timers(self):
-        if self._timer:
-            self._timer.cancel()
-            self._timer = None
-        if self._warn_timer:
-            self._warn_timer.cancel()
-            self._warn_timer = None
+class ToggleListener(_BaseListener):
+    """Press HOTKEY to start, press again to stop + transcribe."""
 
     def on_press(self, key):
         if key != self._key:
             return
         with self._lock:
-            if not self._recorder.active:
-                self._recorder.start()
+            if not self._rec.active:
+                self._rec.start()
                 if NOTIFY_START:
                     notify("Recording…")
-                warn_at = MAX_RECORD - WARN_BEFORE
-                if warn_at > 0:
-                    self._warn_timer = threading.Timer(warn_at, self._warn)
-                    self._warn_timer.start()
-                self._timer = threading.Timer(MAX_RECORD, self._auto_stop)
-                self._timer.start()
             else:
-                self._cancel_timers()
-                audio = self._recorder.stop()
-                if audio is not None:
-                    threading.Thread(target=self._process_fn, args=(audio,), daemon=True).start()
+                self._rec.stop()
 
     def on_release(self, key):
-        pass  # toggle mode ignores key release
+        pass
 
 
-class SmartListener:
-    """
-    Smart mode: tap to toggle, long-press to hold-to-record.
-    Tap (release before LONG_PRESS_THRESHOLD) → press again to stop and transcribe.
-    Long-press (still held after LONG_PRESS_THRESHOLD) → release to transcribe.
-    Audio starts immediately on press so nothing is lost during the decision window.
-    """
+class SmartListener(_BaseListener):
+    """Tap to toggle, long-press to hold-to-record (default)."""
 
-    _IDLE             = "idle"
-    _DECIDING         = "deciding"
-    _HOLD_RECORDING   = "hold_recording"
-    _TOGGLE_RECORDING = "toggle_recording"
+    _IDLE, _DECIDING, _HOLD, _TOGGLE = "idle", "deciding", "hold", "toggle"
 
-    def __init__(self, target_key, process_fn=None):
-        self._key = target_key
-        self._recorder = Recorder()
-        self._lock = threading.Lock()
+    def __init__(self, target_key, recorder):
+        super().__init__(target_key, recorder)
         self._state = self._IDLE
         self._decide_timer: threading.Timer | None = None
-        self._warn_timer: threading.Timer | None = None
-        self._max_timer: threading.Timer | None = None
-        self._process_fn = process_fn or process_audio
 
-    def _start_limit_timers(self):
-        warn_at = MAX_RECORD - WARN_BEFORE
-        if warn_at > 0:
-            self._warn_timer = threading.Timer(warn_at, self._on_warn)
-            self._warn_timer.start()
-        self._max_timer = threading.Timer(MAX_RECORD, self._on_max)
-        self._max_timer.start()
-
-    def _cancel_limit_timers(self):
-        if self._warn_timer:
-            self._warn_timer.cancel()
-            self._warn_timer = None
-        if self._max_timer:
-            self._max_timer.cancel()
-            self._max_timer = None
-
-    def _on_warn(self):
-        log(f"⚠  {WARN_BEFORE}s of recording time remaining")
-        if NOTIFICATION:
-            notify(f"Recording — {WARN_BEFORE}s remaining")
-
-    def _on_max(self):
-        log(f"⚠  Max record time ({MAX_RECORD}s) reached, stopping")
-        if NOTIFICATION:
-            notify(f"Max {MAX_RECORD}s reached — transcribing…")
-        with self._lock:
-            self._state = self._IDLE
-            self._warn_timer = None
-            self._max_timer = None
-        audio = self._recorder.stop()
-        if audio is not None:
-            threading.Thread(target=self._process_fn, args=(audio,), daemon=True).start()
+    def _reset(self):
+        self._state = self._IDLE
+        if self._decide_timer:
+            self._decide_timer.cancel()
+            self._decide_timer = None
 
     def _on_decide(self):
-        """Decision timer fired — long press confirmed, switch to hold mode."""
         with self._lock:
-            if self._state != self._DECIDING:
-                return
-            self._state = self._HOLD_RECORDING
-            self._start_limit_timers()
-        log("●  Hold mode (release to transcribe)")
-        if NOTIFY_START:
-            notify("Recording… release to stop")
+            if self._state == self._DECIDING:
+                self._state = self._HOLD
 
     def on_press(self, key):
         if key != self._key:
             return
         with self._lock:
             if self._state == self._IDLE:
-                self._recorder.start()
+                self._rec.start()
                 self._state = self._DECIDING
                 self._decide_timer = threading.Timer(LONG_PRESS_THRESHOLD, self._on_decide)
                 self._decide_timer.start()
-            elif self._state == self._TOGGLE_RECORDING:
-                # Second tap — stop and transcribe
-                self._cancel_limit_timers()
+            elif self._state == self._TOGGLE:
                 self._state = self._IDLE
-                audio = self._recorder.stop()
-                if audio is not None:
-                    threading.Thread(target=self._process_fn, args=(audio,), daemon=True).start()
+                self._rec.stop()
 
     def on_release(self, key):
         if key != self._key:
             return
         with self._lock:
             if self._state == self._DECIDING:
-                # Released before threshold — tap confirmed, switch to toggle mode
                 if self._decide_timer:
                     self._decide_timer.cancel()
                     self._decide_timer = None
-                self._state = self._TOGGLE_RECORDING
-                self._start_limit_timers()
-                log("●  Toggle mode (press again to stop)")
+                self._state = self._TOGGLE
                 if NOTIFY_START:
                     notify("Recording… tap to stop")
-            elif self._state == self._HOLD_RECORDING:
-                # Released during hold — stop and transcribe
-                self._cancel_limit_timers()
+            elif self._state == self._HOLD:
                 self._state = self._IDLE
-                audio = self._recorder.stop()
-                if audio is not None:
-                    threading.Thread(target=self._process_fn, args=(audio,), daemon=True).start()
+                self._rec.stop()
+
+
+def _make_handler(mode, target_key, recorder):
+    return {"hold": HoldListener, "toggle": ToggleListener, "smart": SmartListener}[mode](target_key, recorder)
+
+
+def _load_wav(path: str) -> np.ndarray | None:
+    if not os.path.exists(path) or os.path.getsize(path) < 1024:
+        return None
+    try:
+        with wave.open(path, "rb") as w:
+            frames = w.readframes(w.getnframes())
+    except (wave.Error, EOFError):
+        return None
+    if not frames:
+        return None
+    return np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32767.0
+
+
+def run_recover():
+    """Re-transcribe the last recording from disk → clipboard."""
+    audio = _load_wav(RECORDING_PATH)
+    if audio is None or len(audio) < SAMPLE_RATE * 0.5:
+        log(f"⚠  No recoverable audio at {RECORDING_PATH}")
+        sys.exit(1)
+    secs = len(audio) / SAMPLE_RATE
+    log(f"⟳  Recovering {secs:.1f}s …")
+    text = transcribe(audio)
+    if not text:
+        log("⚠  Nothing transcribed from recovery audio")
+        sys.exit(1)
+    subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True)
+    _log_transcription(text, "recover", secs, trigger="recover")
+    log(f"✓  Recovered → clipboard: {text}")
+    print(text)
 
 
 def run_pipe_mode():
     """Record one utterance, print to stdout, exit. No hotkey listener."""
-    recorder = Recorder()
+    box: dict = {}
+    done = threading.Event()
+
+    def _cb(audio, secs):
+        box["text"] = transcribe(audio)
+        done.set()
+
+    rec = AudioRecorder(sample_rate=SAMPLE_RATE, device=AUDIO_DEVICE, on_audio=_cb)
     log("●  Recording... (press Enter to stop)")
-    recorder.start()
+    rec.start()
     try:
-        input()  # block until Enter
+        input()
     except (KeyboardInterrupt, EOFError):
         pass
-    audio = recorder.stop()
-    if audio is None:
+    rec.stop()
+    if not done.wait(TRANSCRIBE_TIMEOUT + 5):
         sys.exit(1)
-    text = transcribe(audio)
+    text = box.get("text", "")
     if not text:
         sys.exit(1)
-    _log_transcription(text, "pipe", len(audio) / SAMPLE_RATE, trigger="once")
-    print(text)  # stdout only — no clipboard, no paste, no notification
-
-
-def _make_handler(mode, target_key, process_fn):
-    """Create a listener handler for the given mode and processor function."""
-    listeners = {"hold": HoldListener, "toggle": ToggleListener, "smart": SmartListener}
-    return listeners[mode](target_key, process_fn=process_fn)
+    _log_transcription(text, "pipe", None, trigger="once")
+    print(text)
 
 
 def main():
     parser = argparse.ArgumentParser(description="shh-paste — local voice transcription")
     parser.add_argument("--once", action="store_true",
                         help="Pipe mode: record one utterance, print to stdout, exit")
+    parser.add_argument("--recover", action="store_true",
+                        help="Re-transcribe the last recording from disk → clipboard, exit")
     args = parser.parse_args()
 
     _init_db()
-
     if args.once:
         run_pipe_mode()
         return
+    if args.recover:
+        run_recover()
+        return
 
-    # Validate config
+    threading.Thread(target=warm_up_model, daemon=True).start()
+
     target_key = HOTKEY_MAP.get(HOTKEY)
     if target_key is None:
         log(f"✗  Unknown HOTKEY '{HOTKEY}'. Valid options: {', '.join(HOTKEY_MAP)}")
@@ -570,57 +626,67 @@ def main():
     if TRIGGER_MODE not in valid_modes:
         log(f"✗  Unknown TRIGGER_MODE '{TRIGGER_MODE}'. Use {', '.join(valid_modes)}.")
         sys.exit(1)
-
     if MEMO_MODE not in valid_modes:
         log(f"✗  Unknown MEMO_MODE '{MEMO_MODE}'. Use {', '.join(valid_modes)}.")
         sys.exit(1)
 
+    # Two recorders so paste vs memo deliver to different processors; only one is ever
+    # active at a time (shared key). The paste one streams to disk for recovery.
+    paste_rec = AudioRecorder(
+        sample_rate=SAMPLE_RATE, device=AUDIO_DEVICE,
+        on_audio=_offload(process_audio), wav_path=RECORDING_PATH,
+        op_timeout=OP_TIMEOUT, on_wedged=_on_wedged,
+    )
+    memo_rec = AudioRecorder(
+        sample_rate=SAMPLE_RATE, device=AUDIO_DEVICE,
+        on_audio=_offload(process_memo),
+        op_timeout=OP_TIMEOUT, on_wedged=_on_wedged,
+    )
+    paste_handler = _make_handler(TRIGGER_MODE, target_key, paste_rec)
+    memo_handler = _make_handler(MEMO_MODE, target_key, memo_rec)
+
+    # SIGUSR1 = rescue: force-stop + transcribe whatever is recording, bypass the keyboard.
+    def _on_rescue(signum, frame):
+        def _do():
+            if not (paste_handler.force_finish() or memo_handler.force_finish()):
+                log("⛑  Rescue signal, but nothing was recording")
+            else:
+                log("⛑  Rescue: stopping + transcribing")
+        threading.Thread(target=_do, daemon=True).start()
+    signal.signal(signal.SIGUSR1, _on_rescue)
+
     log(f"✓  Model: {MODEL} (downloads on first use if not cached)")
     log(f"   Paste mode: {TRIGGER_MODE} | Key: {HOTKEY} | Auto-paste: {AUTO_PASTE}")
     log(f"   Memo mode:  Cmd+{HOTKEY} | File: {MEMO_FILE}")
-    log(f"   Filler removal: {FILLER_REMOVE} | Notification: {NOTIFICATION}")
+    log(f"   Audio: dedicated serialized thread | self-heal > {OP_TIMEOUT:.0f}s | recovery: {RECORDING_PATH}")
     if TRIGGER_MODE == "hold":
         log(f"   Hold {HOTKEY} to record, release to transcribe.")
     elif TRIGGER_MODE == "toggle":
         log(f"   Press {HOTKEY} to start, press again to stop and transcribe.")
     else:
         log(f"   Tap {HOTKEY} to toggle. Long-press ({LONG_PRESS_THRESHOLD}s) to hold-to-record.")
-    log(f"   Hold Cmd + tap {HOTKEY} for voice memo → {MEMO_FILE}")
+    log(f"   Rescue a stuck recording: pkill -USR1 -f shh_paste.py  (or: shh rescue)")
     log("")
     log("   If the hotkey does not respond, grant Accessibility access:")
     log("   System Settings → Privacy & Security → Accessibility → enable Terminal")
     log("")
     log("Ready — waiting for hotkey (Ctrl+C to quit)...")
 
-    # Build handlers — both use the same key, routed by Cmd modifier state
-    paste_handler = _make_handler(TRIGGER_MODE, target_key, process_audio)
-    memo_handler = _make_handler(MEMO_MODE, target_key, process_memo)
-
-    # Track Cmd modifier state
     _cmd_held = {"value": False}
 
     def _dispatch_press(key):
         if key in (keyboard.Key.cmd, keyboard.Key.cmd_l, keyboard.Key.cmd_r):
             _cmd_held["value"] = True
             return
-        if _cmd_held["value"]:
-            memo_handler.on_press(key)
-        else:
-            paste_handler.on_press(key)
+        (memo_handler if _cmd_held["value"] else paste_handler).on_press(key)
 
     def _dispatch_release(key):
         if key in (keyboard.Key.cmd, keyboard.Key.cmd_l, keyboard.Key.cmd_r):
             _cmd_held["value"] = False
             return
-        if _cmd_held["value"]:
-            memo_handler.on_release(key)
-        else:
-            paste_handler.on_release(key)
+        (memo_handler if _cmd_held["value"] else paste_handler).on_release(key)
 
-    with keyboard.Listener(
-        on_press=_dispatch_press,
-        on_release=_dispatch_release,
-    ) as listener:
+    with keyboard.Listener(on_press=_dispatch_press, on_release=_dispatch_release) as listener:
         try:
             listener.join()
         except KeyboardInterrupt:

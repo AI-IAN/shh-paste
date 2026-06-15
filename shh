@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# shh — control helper for shh-paste (local voice transcription)
+# Self-contained: manages the daemon by process name and keeps its pid/log in a
+# standard per-user state dir. No external dependencies beyond uv.
+set -euo pipefail
+
+PROJ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/shh-paste"
+PIDFILE="$STATE_DIR/shh-paste.pid"
+LOG="$STATE_DIR/shh-paste.log"
+mkdir -p "$STATE_DIR"
+
+# Resolve the running python daemon (not the uv launcher), whoever started it.
+daemon_pid() {
+  pgrep -f '[s]hh_paste.py' | while read -r p; do
+    ps -o command= -p "$p" | grep -qi python && echo "$p"
+  done | head -1
+}
+
+usage() {
+  cat <<'EOF'
+shh — control helper for shh-paste
+
+USAGE
+  shh <command>
+
+RUN
+  start      Start the daemon in the background (logs to the state dir).
+  stop       Stop the daemon.
+  restart    Restart the daemon.
+  status     Show whether it's running, plus the last few log lines.
+  logs       Tail the log (Ctrl-C to exit).
+
+IF A RECORDING STICKS (orange mic dot stays on)
+  rescue     Force-stop + transcribe the current recording (SIGUSR1) → clipboard.
+             Try this first. The daemon also self-heals a wedged op within ~8s.
+  recover    Re-transcribe the LAST recording from disk → clipboard.
+  stuck      Capture a stack trace of the live process for diagnostics (macOS).
+
+  help       This help.
+EOF
+}
+
+cmd="${1:-help}"
+case "$cmd" in
+  start)
+    p="$(daemon_pid || true)"
+    if [ -n "${p:-}" ]; then echo "● already running (pid $p)"; exit 0; fi
+    nohup uv run "$PROJ_DIR/shh_paste.py" >>"$LOG" 2>&1 &
+    echo "$!" > "$PIDFILE"
+    echo "started — logging to $LOG"
+    ;;
+  stop)
+    p="$(daemon_pid || true)"
+    if [ -n "${p:-}" ]; then kill "$p" 2>/dev/null && echo "stopped"; else echo "not running"; fi
+    ;;
+  restart)
+    "$0" stop || true
+    sleep 1
+    "$0" start
+    ;;
+  status)
+    p="$(daemon_pid || true)"
+    if [ -n "${p:-}" ]; then echo "● running (pid $p)"; else echo "○ not running"; fi
+    [ -f "$LOG" ] && { echo "--- last 6 log lines ---"; tail -6 "$LOG"; } || true
+    ;;
+  logs)
+    tail -f "$LOG"
+    ;;
+  rescue)
+    p="$(daemon_pid || true)"
+    if [ -z "${p:-}" ]; then echo "not running. try: shh recover"; exit 1; fi
+    if kill -USR1 "$p" 2>/dev/null; then
+      echo "⛑  rescue sent — check the clipboard in a few seconds (paste with Cmd-V)."
+      echo "   nothing there? the audio is on disk — try: shh recover"
+    else
+      echo "couldn't signal pid $p. try: shh recover"
+    fi
+    ;;
+  recover)
+    echo "re-transcribing the last recording from disk …"
+    ( cd "$PROJ_DIR" && exec uv run shh_paste.py --recover )
+    ;;
+  stuck)
+    p="$(daemon_pid || true)"
+    if [ -z "${p:-}" ]; then echo "not running."; exit 1; fi
+    out="$HOME/shh-paste-stuck-$(date +%Y%m%d-%H%M%S).txt"
+    if command -v sample >/dev/null 2>&1; then
+      sample "$p" 3 -file "$out" >/dev/null 2>&1 || true
+      echo "saved: $out"
+    else
+      echo "'sample' not available (macOS only)."
+    fi
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    echo "unknown command: $cmd"; echo; usage; exit 1
+    ;;
+esac
